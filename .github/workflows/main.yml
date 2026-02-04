@@ -1,113 +1,465 @@
-name: RDP
+name: Xray VLESS Reality (with ngrok TCP Tunnel)
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  xray-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Install dependencies
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          sudo apt-get update
+          sudo apt-get install -y curl wget unzip qrencode jq iptables
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+      - name: Install Xray
+        run: |
+          wget -q https://github.com/XTLS/Xray-core/releases/download/v1.8.24/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip
+          sudo mv xray /usr/local/bin/
+          sudo chmod +x /usr/local/bin/xray
+          xray version
+
+      - name: Generate Reality keys
+        run: |
+          echo "Generating Reality X25519 keypair..."
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Generate keys
+          xray x25519 > /tmp/keys.txt 2>&1
+          
+          echo "Raw key output:"
+          cat /tmp/keys.txt
+          echo ""
+          
+          # Extract private key (multiple patterns)
+          PRIVATE_KEY=$(grep -i "private" /tmp/keys.txt | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
+          
+          # Extract public key (multiple patterns)
+          PUBLIC_KEY=$(grep -i "public" /tmp/keys.txt | grep -oE '[A-Za-z0-9_-]{43}' | head -1)
+          
+          # Validate keys
+          if [ ${#PRIVATE_KEY} -lt 40 ]; then
+            echo "ERROR: Invalid private key: '$PRIVATE_KEY'"
+            exit 1
+          fi
+          
+          if [ ${#PUBLIC_KEY} -lt 40 ]; then
+            echo "ERROR: Invalid public key: '$PUBLIC_KEY'"
+            exit 1
+          fi
+          
+          # Generate UUID and Short ID
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          SHORT_ID=$(openssl rand -hex 8)
+          
+          echo "✅ Keys validated:"
+          echo "Private Key: $PRIVATE_KEY"
+          echo "Public Key: $PUBLIC_KEY"
+          echo "UUID: $UUID"
+          echo "Short ID: $SHORT_ID"
+          
+          # Export
+          echo "PRIVATE_KEY=$PRIVATE_KEY" >> $GITHUB_ENV
+          echo "PUBLIC_KEY=$PUBLIC_KEY" >> $GITHUB_ENV
+          echo "UUID=$UUID" >> $GITHUB_ENV
+          echo "SHORT_ID=$SHORT_ID" >> $GITHUB_ENV
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: Install ngrok
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          echo "Installing ngrok..."
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install -y ngrok
+          
+          # Configure ngrok with your auth token
+          if [ -n "${{ secrets.NGROK_AUTH_TOKEN }}" ]; then
+            ngrok config add-authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
+            echo "✅ Ngrok auth token configured"
+          else
+            echo "⚠️  Warning: NGROK_AUTH_TOKEN secret not set"
+            echo "Please add your ngrok auth token as a GitHub secret:"
+            echo "1. Go to https://dashboard.ngrok.com/get-started/your-authtoken"
+            echo "2. Copy your authtoken"
+            echo "3. Go to GitHub repo Settings → Secrets → Actions → New repository secret"
+            echo "4. Name: NGROK_AUTH_TOKEN, Value: your_token"
+            exit 1
+          fi
+
+      - name: Create Xray config
+        run: |
+          mkdir -p /tmp/xray
+          
+          # Create config with proper escaping
+          cat > /tmp/xray/config.json << ENDCONFIG
+          {
+            "log": {
+              "loglevel": "info",
+              "access": "/tmp/xray-access.log",
+              "error": "/tmp/xray-error.log"
+            },
+            "inbounds": [
+              {
+                "port": 8443,
+                "listen": "0.0.0.0",
+                "protocol": "vless",
+                "settings": {
+                  "clients": [
+                    {
+                      "id": "${UUID}",
+                      "flow": "xtls-rprx-vision",
+                      "level": 0
+                    }
+                  ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "dest": "www.microsoft.com:443",
+                    "serverNames": [
+                      "www.microsoft.com",
+                      "microsoft.com"
+                    ],
+                    "privateKey": "${PRIVATE_KEY}",
+                    "shortIds": [
+                      "${SHORT_ID}",
+                      ""
+                    ]
+                  }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": ["http", "tls", "quic"]
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "tag": "direct",
+                "settings": {
+                  "domainStrategy": "UseIP"
+                }
+              },
+              {
+                "protocol": "blackhole",
+                "tag": "block"
+              }
+            ],
+            "routing": {
+              "rules": [
+                {
+                  "type": "field",
+                  "outboundTag": "block",
+                  "protocol": ["bittorrent"]
+                }
+              ]
+            }
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          ENDCONFIG
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "✅ Configuration created"
+          cat /tmp/xray/config.json | jq .
+
+      - name: Setup firewall
+        run: |
+          echo "Configuring firewall..."
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          # Allow port 8443
+          sudo iptables -A INPUT -p tcp --dport 8443 -j ACCEPT
+          sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          
+          echo "✅ Firewall configured"
+
+      - name: Start Xray server
+        run: |
+          echo "Starting Xray server..."
+          
+          # Start Xray
+          nohup xray run -c /tmp/xray/config.json > /tmp/xray-main.log 2>&1 &
+          XRAY_PID=$!
+          echo "XRAY_PID=$XRAY_PID" >> $GITHUB_ENV
+          
+          sleep 5
+          
+          # Verify Xray is running
+          if ! ps -p $XRAY_PID > /dev/null; then
+            echo "❌ Xray failed to start!"
+            echo "Main log:"
+            cat /tmp/xray-main.log
+            echo ""
+            echo "Error log:"
+            cat /tmp/xray-error.log 2>/dev/null || echo "No error log"
+            exit 1
+          fi
+          
+          echo "✅ Xray started (PID: $XRAY_PID)"
+          
+          # Check listening port
+          if ss -tlnp | grep :8443; then
+            echo "✅ Listening on port 8443"
+          else
+            echo "❌ Port 8443 not listening"
+            exit 1
+          fi
+
+      - name: Start ngrok TCP tunnel
+        run: |
+          echo "Starting ngrok TCP tunnel on port 8443..."
+          
+          # Start ngrok TCP tunnel in background
+          nohup ngrok tcp 8443 --log stdout > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "NGROK_PID=$NGROK_PID" >> $GITHUB_ENV
+          
+          # Wait for ngrok to start
+          echo "Waiting for ngrok tunnel to establish..."
+          sleep 10
+          
+          # Get ngrok tunnel URL
+          echo "Fetching ngrok tunnel info..."
+          NGROK_API_URL="http://localhost:4040/api/tunnels"
+          
+          # Try multiple times to get tunnel info
+          for i in {1..10}; do
+            sleep 3
+            echo "Attempt $i to get ngrok tunnel info..."
+            
+            if curl -s $NGROK_API_URL > /tmp/ngrok_api.json 2>/dev/null; then
+              # Parse the tunnel information
+              NGROK_URL=$(jq -r '.tunnels[] | select(.proto == "tcp") | .public_url' /tmp/ngrok_api.json)
+              
+              if [ -n "$NGROK_URL" ] && [ "$NGROK_URL" != "null" ]; then
+                # Extract host and port from tcp://0.tcp.ngrok.io:12345
+                NGROK_HOST_PORT=${NGROK_URL#tcp://}
+                NGROK_HOST=$(echo $NGROK_HOST_PORT | cut -d: -f1)
+                NGROK_PORT=$(echo $NGROK_HOST_PORT | cut -d: -f2)
+                
+                echo "✅ Ngrok tunnel established!"
+                echo "Ngrok URL: $NGROK_URL"
+                echo "Host: $NGROK_HOST"
+                echo "Port: $NGROK_PORT"
+                
+                echo "NGROK_HOST=$NGROK_HOST" >> $GITHUB_ENV
+                echo "NGROK_PORT=$NGROK_PORT" >> $GITHUB_ENV
+                echo "NGROK_URL=$NGROK_URL" >> $GITHUB_ENV
+                
+                # Show ngrok dashboard
+                echo "📊 Ngrok dashboard: http://localhost:4040"
+                break
+              fi
+            else
+              echo "Ngrok API not ready yet..."
+            fi
+          done
+          
+          if [ -z "$NGROK_HOST" ]; then
+            echo "❌ Failed to get ngrok tunnel info"
+            echo "Ngrok log:"
+            cat /tmp/ngrok.log
+            exit 1
+          fi
+
+      - name: Generate connection info
+        run: |
+          # Use ngrok tunnel
+          if [ -n "$NGROK_HOST" ] && [ -n "$NGROK_PORT" ]; then
+            SERVER_IP=$NGROK_HOST
+            SERVER_PORT=$NGROK_PORT
+            TUNNEL_TYPE="ngrok TCP Tunnel"
+          else
+            echo "⚠️  Ngrok tunnel not available, using localhost"
+            SERVER_IP="localhost"
+            SERVER_PORT=8443
+            TUNNEL_TYPE="Local only"
+          fi
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
+          echo "🚀 XRAY VLESS REALITY SERVER (via ngrok)"
+          echo "════════════════════════════════════════════════════════════"
+          echo ""
+          echo "🔗 TUNNEL INFO:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "Type: $TUNNEL_TYPE"
+          echo "Ngrok URL: $NGROK_URL"
+          echo ""
+          
+          echo "📡 CONNECTION DETAILS:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "Address: $SERVER_IP"
+          echo "Port: $SERVER_PORT"
+          echo "UUID: $UUID"
+          echo "Flow: xtls-rprx-vision"
+          echo ""
+          
+          echo "🔐 REALITY SETTINGS:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "Public Key: $PUBLIC_KEY"
+          echo "Short ID: $SHORT_ID"
+          echo "SNI: www.microsoft.com"
+          echo "Fingerprint: chrome"
+          echo "Destination: www.microsoft.com:443"
+          echo ""
+          
+          # Generate VLESS link
+          VLESS_LINK="vless://${UUID}@${SERVER_IP}:${SERVER_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#GitHub-Xray-Reality-ngrok"
+          
+          echo "🔗 VLESS URI (Copy this):"
+          echo "────────────────────────────────────────────────────────────"
+          echo "$VLESS_LINK"
+          echo ""
+          
+          echo "📱 QR CODE:"
+          echo "────────────────────────────────────────────────────────────"
+          qrencode -t ANSIUTF8 "$VLESS_LINK"
+          echo ""
+          
+          echo "📋 MANUAL CONFIGURATION (v2rayN):"
+          echo "────────────────────────────────────────────────────────────"
+          echo "1. Open v2rayN"
+          echo "2. Servers → Add VLESS Server"
+          echo "3. Fill in:"
+          echo "   • Address: $SERVER_IP"
+          echo "   • Port: $SERVER_PORT"
+          echo "   • UUID: $UUID"
+          echo "   • Flow: xtls-rprx-vision"
+          echo "   • Encryption: none"
+          echo "   • Network: tcp"
+          echo ""
+          echo "4. TLS Settings:"
+          echo "   • Security: reality"
+          echo "   • SNI: www.microsoft.com"
+          echo "   • Fingerprint: chrome"
+          echo "   • PublicKey: $PUBLIC_KEY"
+          echo "   • ShortId: $SHORT_ID"
+          echo ""
+          
+          echo "✅ SUPPORTED CLIENTS:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "• v2rayN (Windows) - Recommended"
+          echo "• v2rayNG (Android)"
+          echo "• Nekoray (Cross-platform)"
+          echo "• Shadowrocket (iOS)"
+          echo "• Hiddify (Multi-platform)"
+          echo ""
+          
+          echo "🔧 TESTING CONNECTION:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "1. Copy the VLESS URI above"
+          echo "2. Import into your client"
+          echo "3. Test connection"
+          echo "4. Ngrok provides public TCP access (no credit card required)"
+          echo ""
+          
+          echo "📊 NGROK DASHBOARD:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "Local: http://localhost:4040 (view tunnel status)"
+          echo "Online: https://dashboard.ngrok.com/cloud-edge/tunnels"
+          echo ""
+          
+          echo "⚠️  IMPORTANT NOTES:"
+          echo "────────────────────────────────────────────────────────────"
+          echo "• Ngrok free tier: 1 concurrent TCP tunnel"
+          echo "• Connection limit: 40 connections per minute"
+          echo "• Bandwidth limit: 1GB/month"
+          echo "• Tunnel restarts every 2 hours"
+          echo "• For stable service, consider ngrok paid plans"
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
+
+      - name: Monitor server
+        run: |
+          echo ""
+          echo "🔍 Monitoring Xray server (up to 6 hours)..."
+          echo "Press 'Cancel workflow' to stop early"
+          echo ""
+          
+          # Monitor loop
+          for i in {1..2160}; do
+            # Check if Xray is running
+            if ! ps -p $XRAY_PID > /dev/null 2>&1; then
+              echo "❌ Xray died at $(date)"
+              echo ""
+              echo "Main log:"
+              tail -50 /tmp/xray-main.log
+              echo ""
+              echo "Error log:"
+              tail -50 /tmp/xray-error.log 2>/dev/null || echo "No error log"
               exit 1
-          }
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+            fi
+            
+            # Check if ngrok is running
+            if ! ps -p $NGROK_PID > /dev/null 2>&1; then
+              echo "❌ Ngrok died at $(date)"
+              echo ""
+              echo "Ngrok log:"
+              tail -50 /tmp/ngrok.log
               exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+            fi
+            
+            # Status every 5 minutes (30 iterations × 10 seconds)
+            if [ $((i % 30)) -eq 0 ]; then
+              UPTIME=$((i * 10 / 60))
+              
+              # Count connections
+              CONN_COUNT=$(ss -tn state established sport = :8443 2>/dev/null | tail -n +2 | wc -l)
+              
+              echo "[$(date '+%H:%M:%S')] ✅ Running | Uptime: ${UPTIME}m | Connections: $CONN_COUNT"
+              
+              # Show ngrok tunnel status
+              if curl -s http://localhost:4040/api/tunnels > /tmp/ngrok_status.json 2>/dev/null; then
+                NGROK_STATUS=$(jq -r '.tunnels[0].public_url' /tmp/ngrok_status.json 2>/dev/null || echo "Unknown")
+                echo "Ngrok tunnel: $NGROK_STATUS"
+              fi
+              
+              # Show recent accepted connections
+              if [ -f /tmp/xray-access.log ]; then
+                RECENT=$(tail -5 /tmp/xray-access.log | grep "accepted" || echo "No recent connections")
+                if [ "$RECENT" != "No recent connections" ]; then
+                  echo "Recent Xray activity:"
+                  echo "$RECENT"
+                fi
+              fi
+              
+              # Show any errors
+              if [ -f /tmp/xray-error.log ] && [ -s /tmp/xray-error.log ]; then
+                RECENT_ERRORS=$(tail -3 /tmp/xray-error.log)
+                if [ ! -z "$RECENT_ERRORS" ]; then
+                  echo "Recent Xray errors:"
+                  echo "$RECENT_ERRORS"
+                fi
+              fi
+            fi
+            
+            sleep 10
+          done
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          echo "✅ Maximum runtime (6 hours) reached"
 
-      - name: Maintain Connection
+      - name: Cleanup
+        if: always()
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          echo "Cleaning up..."
           
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          # Stop processes
+          kill $XRAY_PID 2>/dev/null || true
+          kill $NGROK_PID 2>/dev/null || true
+          
+          # Show final stats
+          echo ""
+          echo "Final logs (last 20 lines):"
+          echo "Xray access log:"
+          tail -20 /tmp/xray-access.log 2>/dev/null || echo "No access log"
+          echo ""
+          echo "Ngrok log:"
+          tail -20 /tmp/ngrok.log 2>/dev/null || echo "No ngrok log"
+          
+          echo "✅ Cleanup complete"
